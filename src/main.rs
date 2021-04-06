@@ -73,38 +73,68 @@ fn main() {
     dd_____var!(sites.len());
     dd____done!();
 
-    if sites.is_empty() {
-        println!("未收集到有效的域名,命令结束.");
-        return;
-    }
-
-    dd____step!("解析域名IP地址");
     let mut ips = HashMap::new();
-
-    sites.iter().for_each(|d| {
-        let ip = resolve_domain_ip(d);
-        match ip {
-            Ok(ok) => {
-                ips.insert(d, ok);
-            }
-            Err(err) => {
-                println!("{}", err);
+    // 可用的dns;
+    let dns = vec![
+        // "223.5.5.5".to_string(),
+        // "114.114.114.114".to_string(),
+        "8.8.8.8".to_string(),
+    ];
+    // 尝试使用nslookup;
+    let mut find = vec![];
+    let first_find = sites.clone();
+    for (index, domain) in first_find.iter().enumerate().rev() {
+        let mut find_ip = String::default();
+        for dns in dns.iter() {
+            match nslookup(domain, dns) {
+                Ok(ip) => {
+                    find_ip = ip.clone();
+                    ips.insert(domain, ip.clone());
+                }
+                Err(err) => {
+                    println!("{}", err);
+                }
             }
         }
-    });
+        if !find_ip.is_empty() {
+            find.push(index);
+        }
+    }
+    // 删除处理过的网址
+    let mut second_find = sites.clone();
+    for index in find {
+        second_find.remove(index);
+    }
+
+    // 如果网址都处理完了,结束.
+    if !second_find.is_empty() {
+        dd____step!("使用 `ipaddress.com` 解析域名IP地址");
+
+        sites.iter().for_each(|d| {
+            let ip = resolve_domain_ip(d);
+            match ip {
+                Ok(ok) => {
+                    ips.insert(d, ok);
+                }
+                Err(err) => {
+                    println!("{}", err);
+                }
+            }
+        });
+    }
 
     dd____step!("按参数顺序打印结果");
     println!("\n# 解析结果\n\n");
     sites.iter().for_each(|s| {
         let no_find = String::from("# Parse failure");
-        let ip = ips.get(&s).unwrap_or(&no_find);
+        let ip = ips.get(s).unwrap_or(&no_find);
         println!("{}    {}", ip, s);
     });
     println!();
 }
 
 fn resolve_domain_ip(domain: &String) -> Result<String, Box<dyn Error>> {
-    dd________!("请求 {}", domain);
+    println!("请求 {}", domain);
     let res = reqwest::blocking::get(format!("http://{}.ipaddress.com", domain))?;
 
     let status = res.status();
@@ -130,6 +160,55 @@ fn resolve_domain_ip(domain: &String) -> Result<String, Box<dyn Error>> {
         None => Err(Box::new(ResolveIPError {
             msg: format!("解析域名 `{}` 的IP地址失败 :\n{}", domain, body),
         })),
+    }
+}
+
+fn nslookup(domain: &String, dns: &String) -> Result<String, Box<dyn Error>> {
+    match std::process::Command::new("nslookup")
+        .arg(domain)
+        .arg(dns)
+        .output()
+    {
+        Ok(ok) => {
+            if ok.stdout.is_empty() {
+                println!("{}", ok.status);
+                return Err(Box::new(ResolveIPError {
+                    msg: format!("转换 `nslookup` {} {} 结果出错 :\n{:#?}", domain, dns, ok),
+                }));
+            } else {
+                let out = String::from_utf8(ok.stdout.as_slice().to_vec());
+                match out {
+                    Ok(content) => {
+                        let split = content.rsplitn(2, ':').next();
+                        match split {
+                            Some(ip_text) => {
+                                let ip = ip_text.trim().to_string();
+                                println!("‹{}›\tnslookup {} from {}", ip, domain, dns);
+                                return Ok(ip);
+                            }
+                            None => {
+                                return Err(Box::new(ResolveIPError {
+                                    msg: format!(
+                                        "提取 `nslookup` {} {} 结果出错 :\n{}",
+                                        domain, dns, content
+                                    ),
+                                }));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(Box::new(ResolveIPError {
+                            msg: format!("转换 `nslookup` {} {} 结果出错 :\n{}", domain, dns, err),
+                        }));
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            return Err(Box::new(ResolveIPError {
+                msg: format!("执行 `nslookup` {} {} 出错 :\n{}", domain, dns, err),
+            }));
+        }
     }
 }
 
