@@ -4,8 +4,149 @@ use clap::{App, Arg};
 use develop_debug::*;
 
 fn main() {
-    dd___title!("准备查看网站IP地址");
-    let siteip = App::new("Look at the site IP address")
+    dd___title!("解析域名IP地址命令正在运行");
+    // 默认域名服务器
+    let default_domain_name_servers = ["8.8.8.8", "223.5.5.5", "114.114.114.114"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // 配置命令
+    let (input_site, input_file, input_dns) = cfg_cmd_args(&default_domain_name_servers);
+
+    dd____step!("提取输入的参数");
+    // 输入的域名
+    let domains = extract_domains(&input_site, &input_file);
+    // 输入的域名服务器
+    let dnss = extract_dnss(&input_dns).unwrap_or(default_domain_name_servers.clone());
+    dd____iter!(domains.iter(), dnss.iter());
+
+    dd____step!("检查域名不能为空");
+    if domains.is_empty() {
+        let msg = "输入域名为空,运行结束.";
+        dd___error!(msg);
+        println!("{}", msg);
+        return;
+    }
+    dd____done!(format!("共提取 {} 个域名", domains.len()));
+
+    // 存储解析到的 域名和地址
+    let mut domain_ip_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    dd____step!("执行 nslookup 命令获取域名地址");
+    let mut indexs = vec![];
+
+    for (index, domain) in domains.iter().enumerate().rev() {
+        let mut find = false;
+        println!("\nnslookup {}", domain);
+        for dns in &dnss {
+            match nslookup(domain, dns) {
+                Ok(ip) => {
+                    find = true;
+                    let ips = domain_ip_map.entry(domain.to_string()).or_insert(vec![]);
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("nslookup error : {}", err);
+                }
+            }
+        }
+        if find {
+            indexs.push(index);
+        }
+    }
+    dd____done!("执行 nslookup 完毕");
+
+    // 删除处理过的网址
+    dd____step!("检查是否全部域名都获取到IP地址");
+    let mut ipaddress = domains.clone();
+    for index in indexs {
+        ipaddress.remove(index);
+    }
+
+    if ipaddress.is_empty() {
+        dd____iter!(domain_ip_map.iter());
+        dd____done!("检查完毕");
+    } else {
+        // 如果 domains 未处理完,使用 ipaddress 继续处理
+        dd___error!(format!("剩余 {} 个域名获取IP地址失败", ipaddress.len()));
+        dd____step!("从 ipaddress.com 获取IP地址");
+        for domain in ipaddress {
+            match resolve_domain_ip(&domain) {
+                Ok(ip) => {
+                    let ips = domain_ip_map.entry(domain).or_insert(vec![]);
+                    ips.push(ip);
+                }
+                Err(err) => {
+                    dd___error!(format!("从 ipaddress.com 获取出错 {}", err));
+                    println!("{}", err);
+                }
+            }
+        }
+        dd____iter!(domain_ip_map.iter());
+        dd____done!("从 ipaddress.com 获取结束");
+    }
+
+    dd____step!("对多个IP地址执行 ping 并获取响应最快的");
+    let need_do_ping = domain_ip_map
+        .clone()
+        .into_iter()
+        .filter(|item| item.1.len() > 1)
+        .collect::<HashMap<String, Vec<String>>>();
+    dd_____var!(need_do_ping.len());
+    // 分解异步任务
+    let mut do_ping = vec![];
+    for (k, v) in need_do_ping {
+        for ip in v {
+            do_ping.push((k.clone(), ip));
+        }
+    }
+    // 创建异步任务??
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let tasks: Vec<_> = do_ping
+        .iter_mut()
+        .map(|(domain, ip)| {
+            dd________!("add task ping {} {}", domain, ip);
+            rt.spawn(ping(domain.to_string(), ip.to_string()))
+        })
+        .collect();
+
+    rt.block_on(async {
+        let mut result: HashMap<String, (String, f64)> = HashMap::new();
+        for task in tasks {
+            let (domain, ip, time) = task.await.unwrap();
+            let (oip, otime) = result.entry(domain).or_insert((ip.to_string(), time));
+            if time < *otime {
+                *oip = ip;
+                *otime = time;
+            }
+        }
+
+        for (domain, (ip, _time)) in result {
+            domain_ip_map.entry(domain).and_modify(|item| {
+                *item = vec![ip];
+            });
+        }
+        dd____done!("执行 ping 结束");
+
+        // 按顺序打印
+        println!("\n# 解析 {} 个域名\n\n", domain_ip_map.len());
+        for site in &domains {
+            let no_find = vec!["# Parse failure".to_string()];
+            let ip = domain_ip_map.get(site).unwrap_or(&no_find);
+            println!("{:<15}    {}", ip[0], site);
+        }
+
+        println!();
+    });
+}
+
+/// config command and return args (input_site,input_file,input_dns)
+fn cfg_cmd_args(dnss: &Vec<String>) -> (String, String, String) {
+    let app = App::new("Look at the site IP address")
         .version("0.1.0")
         .author("cheeroncode <code@autodo.xyz>")
         .about("A simple tool")
@@ -25,39 +166,49 @@ fn main() {
                 .help("Set the path to the file, and each line in the file contains a domain name")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("dns")
+                .short("n")
+                .long("dns")
+                .value_name("Dns")
+                .help(
+                    &format!("Set which DNS to return the domain name IP address from.\ndefault use DNS:\n{:?}",&dnss
+                ))
+                .takes_value(true),
+        )
         .get_matches();
 
-    dd________!("查看 `site` 参数");
-    let site = siteip.value_of("site").unwrap_or_default();
-    dd_____var!(site);
+    // 获取参数
+    let input_site = app.value_of("site").unwrap_or_default();
+    let input_file = app.value_of("file").unwrap_or_default();
+    let input_dns = app.value_of("dns").unwrap_or_default();
+    dd_____var!(input_site, input_file, input_dns);
+    // 返回参数
+    (
+        input_site.to_string(),
+        input_file.to_string(),
+        input_dns.to_string(),
+    )
+}
 
-    dd________!("查看 `file` 参数");
-    let file = siteip.value_of("file").unwrap_or_default();
-    dd_____var!(file);
-
-    dd____step!("收集要查看IP的网站域名");
-    let mut sites: Vec<String> = vec![];
-
-    // 测试数据
-    // sites.push("github.com".to_string());
-    // sites.push("api.github.com".to_string());
-
+fn extract_domains(site: &String, file: &String) -> Vec<String> {
+    let mut domains = vec![];
+    // 如果设置了多个以空格隔开的域名,添加到 domains
     if !site.is_empty() {
-        dd________!("添加 `site` 参数中指定的域名");
-        let domains = site.split_ascii_whitespace();
-        sites.append(
-            &mut domains
+        domains.append(
+            &mut site
+                .split_ascii_whitespace()
                 .filter(|&d| !d.is_empty())
                 .map(|d| d.to_string())
                 .collect::<Vec<String>>(),
         );
     }
+    // 如果设置了文件参数,且文件中每行有一个域名,添加到 domains
     if !file.is_empty() {
-        dd________!("添加 `file` 文件中的所有域名");
         match fs::read_to_string(file) {
-            Ok(domains) => {
-                sites.append(
-                    &mut domains
+            Ok(fc) => {
+                domains.append(
+                    &mut fc
                         .split('\n')
                         .filter(|&d| !d.is_empty() && !d.contains(&['#', ' ', '\t'][..]))
                         .map(|d| d.to_string())
@@ -65,83 +216,39 @@ fn main() {
                 );
             }
             Err(err) => {
-                eprintln!("请求文件 `{}` 出错 :\n{}", file, err);
+                eprintln!("读取文件 `{}` 出错 : {}", file, err);
             }
         };
     }
-    dd____iter!(sites.iter());
-    dd_____var!(sites.len());
-    dd____done!();
+    return domains;
+}
 
-    let mut ips = HashMap::new();
-    // 可用的dns;
-    let dns = vec![
-        // "223.5.5.5".to_string(),
-        // "114.114.114.114".to_string(),
-        "8.8.8.8".to_string(),
-    ];
-    // 尝试使用nslookup;
-    let mut find = vec![];
-    let first_find = sites.clone();
-    for (index, domain) in first_find.iter().enumerate().rev() {
-        let mut find_ip = String::default();
-        for dns in dns.iter() {
-            match nslookup(domain, dns) {
-                Ok(ip) => {
-                    find_ip = ip.clone();
-                    ips.insert(domain, ip.clone());
-                }
-                Err(err) => {
-                    println!("{}", err);
-                }
-            }
-        }
-        if !find_ip.is_empty() {
-            find.push(index);
-        }
+fn extract_dnss(dns: &String) -> Option<Vec<String>> {
+    let mut dnss = vec![];
+    // 如果设置了多个以空格隔开的域名,添加到 domains
+    if !dns.is_empty() {
+        dnss.append(
+            &mut dns
+                .split_ascii_whitespace()
+                .filter(|&d| !d.is_empty())
+                .map(|d| d.to_string())
+                .collect::<Vec<String>>(),
+        );
+        Some(dnss)
+    } else {
+        None
     }
-    // 删除处理过的网址
-    let mut second_find = sites.clone();
-    for index in find {
-        second_find.remove(index);
-    }
-
-    // 如果网址都处理完了,结束.
-    if !second_find.is_empty() {
-        dd____step!("使用 `ipaddress.com` 解析域名IP地址");
-
-        sites.iter().for_each(|d| {
-            let ip = resolve_domain_ip(d);
-            match ip {
-                Ok(ok) => {
-                    ips.insert(d, ok);
-                }
-                Err(err) => {
-                    println!("{}", err);
-                }
-            }
-        });
-    }
-
-    dd____step!("按参数顺序打印结果");
-    println!("\n# 解析结果\n\n");
-    sites.iter().for_each(|s| {
-        let no_find = String::from("# Parse failure");
-        let ip = ips.get(s).unwrap_or(&no_find);
-        println!("{}    {}", ip, s);
-    });
-    println!();
 }
 
 fn resolve_domain_ip(domain: &String) -> Result<String, Box<dyn Error>> {
-    println!("请求 {}", domain);
+    println!("query {}", domain);
     let res = reqwest::blocking::get(format!("http://{}.ipaddress.com", domain))?;
 
-    let status = res.status();
-    dd_____var!(status);
+    // let status = res.status();
+    // dd_____var!(status);
 
-    let header = res.headers();
-    dd____iter!(header.iter());
+    // let header = res.headers();
+    // dd____iter!(header.iter());
 
     let body = res.text()?;
     let start = "https://www.ipaddress.com/ipv4/";
@@ -153,8 +260,7 @@ fn resolve_domain_ip(domain: &String) -> Result<String, Box<dyn Error>> {
 
     match split_ip {
         Some(ip) => {
-            dd_____var!(ip);
-            dd____done!();
+            println!("{} from ipaddress.com", ip);
             Ok(ip.to_string())
         }
         None => Err(Box::new(ResolveIPError {
@@ -183,7 +289,7 @@ fn nslookup(domain: &String, dns: &String) -> Result<String, Box<dyn Error>> {
                         match split {
                             Some(ip_text) => {
                                 let ip = ip_text.trim().to_string();
-                                println!("‹{}›\tnslookup {} from {}", ip, domain, dns);
+                                println!("{}\t from  {}", ip, dns);
                                 return Ok(ip);
                             }
                             None => {
@@ -212,6 +318,51 @@ fn nslookup(domain: &String, dns: &String) -> Result<String, Box<dyn Error>> {
     }
 }
 
+// ping -c 5 github.com
+async fn ping(domain: String, ip: String) -> (String, String, f64) {
+    match std::process::Command::new("ping")
+        .arg("-c")
+        .arg("5")
+        .arg(&ip)
+        .output()
+    {
+        Ok(ok) => {
+            // 提取响应时间
+            if ok.stdout.is_empty() {
+                println!("转换 `ping` 结果出错 {}", ok.status);
+                return (domain, ip, 10000.2);
+            } else {
+                let out = String::from_utf8(ok.stdout.as_slice().to_vec());
+                match out {
+                    Ok(content) => {
+                        // 64 bytes from 192.30.255.113: icmp_seq=4 ttl=48 time=398.154 ms
+                        let time = content
+                            .split("min/avg/max/stddev = ")
+                            .nth(1)
+                            .and_then(|s| s.split('/').nth(1))
+                            .and_then(|f| f.parse::<f64>().ok());
+
+                        match time {
+                            Some(tf) => {
+                                println!("{:<15}  time = {}  # {}", &ip, tf, &domain);
+                                return (domain, ip, tf);
+                            }
+                            None => {
+                                println!("{} timeout # {}", ip, domain);
+                                return (domain, ip, 10000.4);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        println!("提取 `ping` 结果出错 {}", err);
+                        return (domain, ip, 10000.3);
+                    }
+                }
+            }
+        }
+        Err(_) => (domain, ip, 10000.1),
+    }
+}
 #[derive(Debug)]
 struct ResolveIPError {
     msg: String,
